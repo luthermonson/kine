@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -569,4 +570,80 @@ func TestVersionIncrement(t *testing.T) {
 	_, kv, err = b.Get(ctx, "/test/a", "", 0, 0, false)
 	noErr(t, err)
 	expEqual(t, int64(3), kv.Version)
+}
+
+// TestTTLExpiration creates 10 keys with leases spread across a ~30 second
+// window and verifies the TTL goroutine deletes each one after its lease
+// elapses. This exercises the workqueue + watch driven expiration path.
+func TestTTLExpiration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping long-running TTL test in -short mode")
+	}
+
+	b, ctx := setupBackend(t)
+
+	type seeded struct {
+		key   string
+		lease int64
+	}
+	leases := []int64{2, 4, 6, 9, 12, 15, 18, 22, 25, 28}
+	keys := make([]seeded, 0, len(leases))
+
+	start := time.Now()
+	for i, lease := range leases {
+		key := fmt.Sprintf("/test/lease-%02d", i)
+		_, err := b.Create(ctx, key, []byte("v"), lease)
+		noErr(t, err)
+		keys = append(keys, seeded{key, lease})
+	}
+
+	// All keys should be present immediately after creation.
+	_, ents, err := b.List(ctx, "/test/", "", 0, 0, false)
+	noErr(t, err)
+	expEqual(t, len(leases), len(ents))
+
+	// Each key should be deleted shortly after its lease elapses. We poll up
+	// to a small grace period after the deadline to absorb workqueue
+	// scheduling latency, and assert that other keys whose leases have not
+	// yet elapsed are still present.
+	const grace = 3 * time.Second
+	for i, k := range keys {
+		deadline := start.Add(time.Duration(k.lease)*time.Second + grace)
+		for {
+			_, kv, err := b.Get(ctx, k.key, "", 0, 0, false)
+			noErr(t, err)
+			if kv == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("key %s with lease=%ds still present %v after creation",
+					k.key, k.lease, time.Since(start))
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		// Keys with later leases should still be alive — only ones we have
+		// already passed the deadline for are allowed to be gone.
+		for j := i + 1; j < len(keys); j++ {
+			next := keys[j]
+			elapsed := time.Since(start)
+			if elapsed >= time.Duration(next.lease)*time.Second {
+				continue
+			}
+			_, kv, err := b.Get(ctx, next.key, "", 0, 0, false)
+			noErr(t, err)
+			if kv == nil {
+				t.Fatalf("key %s with lease=%ds removed prematurely at %v",
+					next.key, next.lease, elapsed)
+			}
+		}
+	}
+
+	// After the longest lease has expired plus a grace period, nothing
+	// should remain under /test/.
+	_, ents, err = b.List(ctx, "/test/", "", 0, 0, false)
+	noErr(t, err)
+	if len(ents) != 0 {
+		t.Fatalf("expected /test/ to be empty after all leases expired, got %d keys", len(ents))
+	}
 }
