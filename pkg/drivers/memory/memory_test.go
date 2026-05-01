@@ -56,7 +56,7 @@ func setupBackend(t *testing.T) (*Backend, context.Context) {
 	t.Cleanup(cancel)
 	// Skip Start() to avoid the production seed entries (compact_rev_key,
 	// /registry/health) so tests can assert exact revision values.
-	go b.expireLoop(ctx)
+	go b.ttl(ctx)
 	return b, ctx
 }
 
@@ -416,6 +416,78 @@ func TestCompact(t *testing.T) {
 	_, ents, err = b.List(ctx, "/test/", "", 0, 2, false)
 	noErr(t, err)
 	expEqual(t, 2, len(ents))
+}
+
+func TestCompactTrimsHistory(t *testing.T) {
+	b, ctx := setupBackend(t)
+
+	rev1, _ := b.Create(ctx, "/test/a", []byte("v1"), 0)
+	b.Create(ctx, "/test/b", []byte("v1"), 0)
+	rev3, _, _, _ := b.Update(ctx, "/test/a", []byte("v2"), rev1, 0)
+	b.Update(ctx, "/test/a", []byte("v3"), rev3, 0)
+	// 4 log entries, /test/a has 3 versions, /test/b has 1.
+
+	if got := len(b.log); got != 4 {
+		t.Fatalf("log length before compact: got %d, want 4", got)
+	}
+
+	if _, err := b.Compact(ctx, 4); err != nil {
+		t.Fatal(err)
+	}
+
+	// After compact at rev 4, /test/a keeps only rev 4 (its floor) and
+	// /test/b keeps only rev 2 (its floor).
+	if got := len(b.log); got != 2 {
+		t.Fatalf("log length after compact: got %d, want 2", got)
+	}
+	histA, _ := b.keys.Get("/test/a")
+	if got := len(histA); got != 1 {
+		t.Fatalf("/test/a history after compact: got %d, want 1", got)
+	}
+	histB, _ := b.keys.Get("/test/b")
+	if got := len(histB); got != 1 {
+		t.Fatalf("/test/b history after compact: got %d, want 1", got)
+	}
+
+	// Latest values are still readable at the current revision.
+	_, kv, err := b.Get(ctx, "/test/a", "", 0, 0, false)
+	noErr(t, err)
+	expEqual(t, "v3", string(kv.Value))
+
+	// Calling Compact at a rev <= current compactRevision is a no-op.
+	if _, err := b.Compact(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(b.log); got != 2 {
+		t.Fatalf("log length after no-op compact: got %d, want 2", got)
+	}
+}
+
+func TestCompactDropsTombstones(t *testing.T) {
+	b, ctx := setupBackend(t)
+
+	rev1, _ := b.Create(ctx, "/test/a", []byte("v1"), 0)
+	b.Create(ctx, "/test/b", []byte("v1"), 0)
+	b.Delete(ctx, "/test/a", rev1)
+	// Log: create a (1), create b (2), delete a (3).
+
+	if _, err := b.Compact(ctx, 3); err != nil {
+		t.Fatal(err)
+	}
+
+	// /test/a's tombstone at rev 3 is at-or-below the compact boundary,
+	// so the entire history should be removed.
+	if _, ok := b.keys.Get("/test/a"); ok {
+		t.Fatal("expected /test/a to be removed after compacting tombstone")
+	}
+	// /test/b's floor is its create at rev 2, kept.
+	histB, ok := b.keys.Get("/test/b")
+	if !ok || len(histB) != 1 {
+		t.Fatalf("/test/b history after compact: got %v, want 1 entry", histB)
+	}
+	if got := len(b.log); got != 1 {
+		t.Fatalf("log length after compact: got %d, want 1", got)
+	}
 }
 
 func TestWatchCompacted(t *testing.T) {

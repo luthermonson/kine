@@ -1,8 +1,9 @@
 package memory
 
 import (
-	"container/heap"
 	"context"
+	"errors"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -11,7 +12,10 @@ import (
 	"github.com/k3s-io/kine/pkg/server"
 	"github.com/sirupsen/logrus"
 	"github.com/tidwall/btree"
+	"k8s.io/client-go/util/workqueue"
 )
+
+const ttlRetryInterval = 250 * time.Millisecond
 
 func init() {
 	drivers.Register("memory", New)
@@ -32,6 +36,7 @@ type entry struct {
 	lease          int64
 	created        bool
 	deleted        bool
+	prev           *entry
 }
 
 func (e *entry) toKeyValue() *server.KeyValue {
@@ -45,6 +50,12 @@ func (e *entry) toKeyValue() *server.KeyValue {
 	}
 }
 
+type ttlEventKV struct {
+	key         string
+	modRevision int64
+	expiredAt   time.Time
+}
+
 type Backend struct {
 	mu              sync.RWMutex
 	currentRevision int64
@@ -55,20 +66,14 @@ type Backend struct {
 
 	notifyMu sync.Mutex
 	notifyCh chan struct{}
-
-	expireMu   sync.Mutex
-	expires    expireHeap
-	expireWake chan struct{}
 }
 
 var _ server.Backend = (*Backend)(nil)
 
 func NewBackend() *Backend {
 	return &Backend{
-		keys:       btree.NewMap[string, []*entry](0),
-		notifyCh:   make(chan struct{}),
-		expires:    make(expireHeap, 0),
-		expireWake: make(chan struct{}, 1),
+		keys:     btree.NewMap[string, []*entry](0),
+		notifyCh: make(chan struct{}),
 	}
 }
 
@@ -98,7 +103,7 @@ func (b *Backend) Start(ctx context.Context) error {
 	})
 	b.mu.Unlock()
 
-	go b.expireLoop(ctx)
+	go b.ttl(ctx)
 	return nil
 }
 
@@ -128,6 +133,9 @@ func (b *Backend) nextRevision() int64 {
 func (b *Backend) appendEntry(e *entry) {
 	b.log = append(b.log, e)
 	hist, _ := b.keys.Get(e.key)
+	if len(hist) > 0 {
+		e.prev = hist[len(hist)-1]
+	}
 	b.keys.Set(e.key, append(hist, e))
 }
 
@@ -169,74 +177,136 @@ func (b *Backend) atRevision(key string, revision int64) *entry {
 	return result
 }
 
-func (b *Backend) scheduleExpire(key string, rev, lease int64) {
-	if lease <= 0 {
-		return
-	}
-	b.expireMu.Lock()
-	heap.Push(&b.expires, &expireEntry{
-		key:     key,
-		rev:     rev,
-		expires: time.Now().Add(time.Duration(lease) * time.Second),
+// logIndexAfter returns the index of the first log entry with revision > rev.
+// Caller must hold at least a read lock on b.mu.
+func (b *Backend) logIndexAfter(rev int64) int {
+	return sort.Search(len(b.log), func(i int) bool {
+		return b.log[i].revision > rev
 	})
-	b.expireMu.Unlock()
-	select {
-	case b.expireWake <- struct{}{}:
-	default:
-	}
 }
 
-func (b *Backend) expireLoop(ctx context.Context) {
-	var timer *time.Timer
-	var timerC <-chan time.Time
+// ttl runs a long-lived goroutine that watches the backend for entries with
+// a non-zero Lease and schedules them for deletion once their TTL expires.
+// It mirrors logstructured.LogStructured.ttl: an initial list seeds the
+// delaying workqueue with any pre-existing leased keys, then a watch picks
+// up new ones. A handler goroutine consumes the queue and calls Delete when
+// each entry reaches its expiration time.
+func (b *Backend) ttl(ctx context.Context) {
+	queue := workqueue.NewTypedDelayingQueue[string]()
+	var rwMu sync.RWMutex
+	store := make(map[string]*ttlEventKV)
 
-	stopTimer := func() {
-		if timer != nil {
-			timer.Stop()
-			timer = nil
-			timerC = nil
+	go func() {
+		for b.handleTTLEvent(ctx, &rwMu, queue, store) {
 		}
+	}()
+
+	rev, kvs, err := b.List(ctx, "/", "", 0, 0, false)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			logrus.Errorf("TTL initial list failed: %v", err)
+		}
+		queue.ShutDown()
+		return
+	}
+	for _, kv := range kvs {
+		if kv.Lease <= 0 {
+			continue
+		}
+		expires := storeTTLEventKV(&rwMu, store, kv)
+		logrus.Tracef("TTL add event key=%v, modRev=%v, ttl=%v", kv.Key, kv.ModRevision, expires)
+		queue.AddAfter(kv.Key, expires)
+	}
+
+	// Watch from rev+1 to avoid replaying entries we just observed via
+	// List. Anything appended after List ran has a strictly greater
+	// revision and will be picked up here.
+	wr := b.Watch(ctx, "/", rev+1)
+	if wr.CompactRevision != 0 {
+		logrus.Errorf("TTL event watch failed: %v", server.ErrCompacted)
+		queue.ShutDown()
+		return
 	}
 
 	for {
-		b.expireMu.Lock()
-		if b.expires.Len() == 0 {
-			b.expireMu.Unlock()
-			stopTimer()
-			select {
-			case <-ctx.Done():
-				return
-			case <-b.expireWake:
-				continue
-			}
-		}
-
-		next := b.expires[0]
-		wait := time.Until(next.expires)
-		if wait <= 0 {
-			heap.Pop(&b.expires)
-			b.expireMu.Unlock()
-			b.Delete(ctx, next.key, next.rev)
-			continue
-		}
-		b.expireMu.Unlock()
-
-		if timer == nil {
-			timer = time.NewTimer(wait)
-			timerC = timer.C
-		} else {
-			timer.Reset(wait)
-		}
-
 		select {
 		case <-ctx.Done():
-			stopTimer()
+			queue.ShutDown()
 			return
-		case <-b.expireWake:
-			stopTimer()
-		case <-timerC:
+		case events, ok := <-wr.Events:
+			if !ok {
+				queue.ShutDown()
+				return
+			}
+			for _, event := range events {
+				if event.Delete || event.KV.Lease <= 0 {
+					continue
+				}
+				kv := event.KV
+				stored := loadTTLEventKV(&rwMu, store, kv.Key)
+				if stored == nil {
+					expires := storeTTLEventKV(&rwMu, store, kv)
+					logrus.Tracef("TTL add event key=%v, modRev=%v, ttl=%v", kv.Key, kv.ModRevision, expires)
+					queue.AddAfter(kv.Key, expires)
+				} else if kv.ModRevision > stored.modRevision {
+					expires := storeTTLEventKV(&rwMu, store, kv)
+					logrus.Tracef("TTL update event key=%v, modRev=%v, ttl=%v", kv.Key, kv.ModRevision, expires)
+					queue.AddAfter(kv.Key, expires)
+				}
+			}
 		}
 	}
+}
+
+func (b *Backend) handleTTLEvent(ctx context.Context, mu *sync.RWMutex, queue workqueue.TypedDelayingInterface[string], store map[string]*ttlEventKV) bool {
+	key, shutdown := queue.Get()
+	if shutdown {
+		logrus.Info("TTL events work queue has shut down")
+		return false
+	}
+	defer queue.Done(key)
+
+	kv := loadTTLEventKV(mu, store, key)
+	if kv == nil {
+		logrus.Errorf("TTL event not found for key=%v", key)
+		return true
+	}
+
+	if expires := time.Until(kv.expiredAt); expires > 0 {
+		logrus.Tracef("TTL has not expired for key=%v, ttl=%v, requeuing", key, expires)
+		queue.AddAfter(key, expires)
+		return true
+	}
+
+	logrus.Tracef("TTL delete key=%v, modRev=%v", kv.key, kv.modRevision)
+	if _, _, _, err := b.Delete(ctx, kv.key, kv.modRevision); err != nil && !errors.Is(err, context.Canceled) {
+		logrus.Errorf("TTL delete trigger failed for key=%v: %v, requeuing", kv.key, err)
+		queue.AddAfter(kv.key, ttlRetryInterval)
+		return true
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	delete(store, kv.key)
+	return true
+}
+
+func loadTTLEventKV(mu *sync.RWMutex, store map[string]*ttlEventKV, key string) *ttlEventKV {
+	mu.RLock()
+	defer mu.RUnlock()
+	return store[key]
+}
+
+func storeTTLEventKV(mu *sync.RWMutex, store map[string]*ttlEventKV, kv *server.KeyValue) time.Duration {
+	mu.Lock()
+	defer mu.Unlock()
+	expires := time.Duration(kv.Lease) * time.Second
+	store[kv.Key] = &ttlEventKV{
+		key:         kv.Key,
+		modRevision: kv.ModRevision,
+		expiredAt:   time.Now().Add(expires),
+	}
+	return expires
 }
 
 // Get returns the current revision and the KeyValue for the given key.
@@ -256,12 +326,11 @@ func (b *Backend) Get(ctx context.Context, key, rangeEnd string, limit, revision
 
 func (b *Backend) Create(ctx context.Context, key string, value []byte, lease int64) (int64, error) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 
 	latest := b.latest(key)
 	if latest != nil && !latest.deleted {
-		rev := b.currentRevision
-		b.mu.Unlock()
-		return rev, server.ErrKeyExists
+		return b.currentRevision, server.ErrKeyExists
 	}
 
 	rev := b.nextRevision()
@@ -270,7 +339,7 @@ func (b *Backend) Create(ctx context.Context, key string, value []byte, lease in
 		prevRev = latest.revision
 	}
 
-	e := &entry{
+	b.appendEntry(&entry{
 		revision:       rev,
 		key:            key,
 		value:          value,
@@ -279,29 +348,21 @@ func (b *Backend) Create(ctx context.Context, key string, value []byte, lease in
 		prevRevision:   prevRev,
 		lease:          lease,
 		created:        true,
-	}
-	b.appendEntry(e)
+	})
 	b.broadcast()
-	b.mu.Unlock()
-
-	b.scheduleExpire(key, rev, lease)
 	return rev, nil
 }
 
 func (b *Backend) Update(ctx context.Context, key string, value []byte, revision, lease int64) (int64, *server.KeyValue, bool, error) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 
 	latest := b.latest(key)
 	if latest == nil || latest.deleted {
-		rev := b.currentRevision
-		b.mu.Unlock()
-		return rev, nil, false, nil
+		return b.currentRevision, nil, false, nil
 	}
 	if latest.revision != revision {
-		rev := b.currentRevision
-		kv := latest.toKeyValue()
-		b.mu.Unlock()
-		return rev, kv, false, nil
+		return b.currentRevision, latest.toKeyValue(), false, nil
 	}
 
 	rev := b.nextRevision()
@@ -316,11 +377,7 @@ func (b *Backend) Update(ctx context.Context, key string, value []byte, revision
 	}
 	b.appendEntry(e)
 	b.broadcast()
-	kv := e.toKeyValue()
-	b.mu.Unlock()
-
-	b.scheduleExpire(key, rev, lease)
-	return rev, kv, true, nil
+	return rev, e.toKeyValue(), true, nil
 }
 
 func (b *Backend) Delete(ctx context.Context, key string, revision int64) (int64, *server.KeyValue, bool, error) {
@@ -336,7 +393,7 @@ func (b *Backend) Delete(ctx context.Context, key string, revision int64) (int64
 	}
 
 	rev := b.nextRevision()
-	e := &entry{
+	b.appendEntry(&entry{
 		revision:       rev,
 		key:            key,
 		value:          latest.value,
@@ -345,8 +402,7 @@ func (b *Backend) Delete(ctx context.Context, key string, revision int64) (int64
 		prevRevision:   latest.revision,
 		lease:          latest.lease,
 		deleted:        true,
-	}
-	b.appendEntry(e)
+	})
 	b.broadcast()
 	return rev, latest.toKeyValue(), true, nil
 }
@@ -432,6 +488,10 @@ func (b *Backend) Watch(ctx context.Context, prefix string, startRevision int64)
 	go func() {
 		defer close(events)
 
+		// lastSeen is the highest revision already delivered to the caller.
+		// Subsequent passes start from the first log entry whose revision is
+		// greater than lastSeen, looked up via logIndexAfter — direct array
+		// indexing by revision no longer holds once compaction trims b.log.
 		lastSeen := startRevision - 1
 		if lastSeen < 0 {
 			lastSeen = rev
@@ -442,13 +502,10 @@ func (b *Backend) Watch(ctx context.Context, prefix string, startRevision int64)
 
 			b.mu.RLock()
 			var batch []*server.Event
-			startIdx := lastSeen
-			if startIdx < 0 {
-				startIdx = 0
-			}
-			for i := startIdx; i < int64(len(b.log)); i++ {
+			for i := b.logIndexAfter(lastSeen); i < len(b.log); i++ {
 				e := b.log[i]
 				if !strings.HasPrefix(e.key, prefix) {
+					lastSeen = e.revision
 					continue
 				}
 
@@ -458,9 +515,8 @@ func (b *Backend) Watch(ctx context.Context, prefix string, startRevision int64)
 					KV:     e.toKeyValue(),
 					PrevKV: &server.KeyValue{ModRevision: e.prevRevision},
 				}
-
-				if e.prevRevision > 0 && int(e.prevRevision) <= len(b.log) {
-					event.PrevKV = b.log[e.prevRevision-1].toKeyValue()
+				if e.prev != nil {
+					event.PrevKV = e.prev.toKeyValue()
 				}
 
 				batch = append(batch, event)
@@ -495,16 +551,88 @@ func (b *Backend) Watch(ctx context.Context, prefix string, startRevision int64)
 	}
 }
 
+// Compact discards history below the given revision. For each key the latest
+// entry with revision <= the compact target is preserved as the floor (so
+// reads at the compact boundary still resolve), unless that entry is a
+// tombstone — in which case the entire key history is removed. Entries with
+// revision > the compact target are always retained. The log slice is
+// rebuilt to drop any entries that are no longer referenced.
 func (b *Backend) Compact(ctx context.Context, revision int64) (int64, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
 	if revision > b.currentRevision {
 		return b.currentRevision, nil
 	}
+	if revision <= b.compactRevision {
+		return b.currentRevision, nil
+	}
+
+	keep := make(map[*entry]struct{})
+	var toRemove []string
+
+	b.keys.Scan(func(key string, hist []*entry) bool {
+		floorIdx := -1
+		for i, e := range hist {
+			if e.revision <= revision {
+				floorIdx = i
+			} else {
+				break
+			}
+		}
+
+		var newHist []*entry
+		switch {
+		case floorIdx < 0:
+			// No entry at or below the compact boundary; keep everything.
+			newHist = hist
+		case hist[floorIdx].deleted:
+			// Floor is a tombstone — drop it and everything before; readers
+			// at the compact boundary correctly see the key as absent.
+			newHist = hist[floorIdx+1:]
+		default:
+			newHist = hist[floorIdx:]
+		}
+
+		if len(newHist) == 0 {
+			toRemove = append(toRemove, key)
+		} else {
+			if len(newHist) != len(hist) {
+				newHist[0].prev = nil
+				b.keys.Set(key, newHist)
+			}
+			for _, e := range newHist {
+				keep[e] = struct{}{}
+			}
+		}
+		return true
+	})
+
+	for _, k := range toRemove {
+		b.keys.Delete(k)
+	}
+
+	filtered := b.log[:0]
+	for _, e := range b.log {
+		if _, ok := keep[e]; ok {
+			filtered = append(filtered, e)
+		}
+	}
+	for i := len(filtered); i < len(b.log); i++ {
+		b.log[i] = nil
+	}
+	b.log = filtered
+
 	b.compactRevision = revision
 	return b.currentRevision, nil
 }
 
+// seekKey returns the BTree seek target for a List/Range query and a flag
+// indicating whether the iteration should match the seek key exactly. When
+// startKey is empty (or equal to prefix), iteration begins at prefix; if
+// prefix has no trailing slash this is treated as an exact-key lookup.
+// Otherwise startKey is normalized into the prefix's namespace and used as
+// the resume point for paginated range scans.
 func seekKey(prefix, startKey string) (string, bool) {
 	exact := !strings.HasSuffix(prefix, "/") && startKey == ""
 	if startKey == "" || startKey == prefix {
@@ -517,27 +645,4 @@ func seekKey(prefix, startKey string) (string, bool) {
 		return base + "/" + startKey, false
 	}
 	return prefix, exact
-}
-
-// expireEntry is a key scheduled for TTL expiration.
-type expireEntry struct {
-	key     string
-	rev     int64
-	expires time.Time
-}
-
-// expireHeap is a min-heap ordered by expiration time.
-type expireHeap []*expireEntry
-
-func (h expireHeap) Len() int            { return len(h) }
-func (h expireHeap) Less(i, j int) bool   { return h[i].expires.Before(h[j].expires) }
-func (h expireHeap) Swap(i, j int)        { h[i], h[j] = h[j], h[i] }
-func (h *expireHeap) Push(x any)          { *h = append(*h, x.(*expireEntry)) }
-func (h *expireHeap) Pop() any {
-	old := *h
-	n := len(old)
-	e := old[n-1]
-	old[n-1] = nil
-	*h = old[:n-1]
-	return e
 }
