@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/k3s-io/kine/pkg/drivers"
@@ -60,7 +61,7 @@ type ttlEventKV struct {
 
 type Memory struct {
 	mu              sync.RWMutex
-	currentRevision int64
+	currentRevision atomic.Int64
 	compactRevision int64
 
 	log  []*entry
@@ -104,9 +105,7 @@ func (m *Memory) Start(ctx context.Context) error {
 }
 
 func (m *Memory) CurrentRevision(ctx context.Context) (int64, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.currentRevision, nil
+	return m.currentRevision.Load(), nil
 }
 
 func (m *Memory) DbSize(ctx context.Context) (int64, error) {
@@ -121,11 +120,11 @@ func (m *Memory) DbSize(ctx context.Context) (int64, error) {
 
 func (m *Memory) WaitForSyncTo(revision int64) {}
 
-// nextRevision allocates and returns the next revision.
-// Caller must hold m.mu (write).
+// nextRevision allocates and returns the next revision. Increment is
+// atomic; callers still need m.mu (write) when pairing the new revision
+// with an appendEntry, so the log stays in revision order.
 func (m *Memory) nextRevision() int64 {
-	m.currentRevision++
-	return m.currentRevision
+	return m.currentRevision.Add(1)
 }
 
 // appendEntry adds e to the log and to its key's history, wiring up
@@ -353,7 +352,7 @@ func (m *Memory) Create(ctx context.Context, key string, value []byte, lease int
 
 	latest := m.latest(key)
 	if latest != nil && !latest.deleted {
-		return m.currentRevision, server.ErrKeyExists
+		return m.currentRevision.Load(), server.ErrKeyExists
 	}
 
 	rev := m.nextRevision()
@@ -382,10 +381,10 @@ func (m *Memory) Update(ctx context.Context, key string, value []byte, revision,
 
 	latest := m.latest(key)
 	if latest == nil || latest.deleted {
-		return m.currentRevision, nil, false, nil
+		return m.currentRevision.Load(), nil, false, nil
 	}
 	if latest.revision != revision {
-		return m.currentRevision, latest.toKeyValue(), false, nil
+		return m.currentRevision.Load(), latest.toKeyValue(), false, nil
 	}
 
 	rev := m.nextRevision()
@@ -409,10 +408,10 @@ func (m *Memory) Delete(ctx context.Context, key string, revision int64) (int64,
 
 	latest := m.latest(key)
 	if latest == nil || latest.deleted {
-		return m.currentRevision, nil, false, nil
+		return m.currentRevision.Load(), nil, false, nil
 	}
 	if revision != 0 && latest.revision != revision {
-		return m.currentRevision, latest.toKeyValue(), false, nil
+		return m.currentRevision.Load(), latest.toKeyValue(), false, nil
 	}
 
 	rev := m.nextRevision()
@@ -434,9 +433,9 @@ func (m *Memory) List(ctx context.Context, prefix, startKey string, limit, revis
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	rev := m.currentRevision
+	rev := m.currentRevision.Load()
 	if revision > 0 {
-		if revision > m.currentRevision {
+		if revision > rev {
 			return rev, nil, server.ErrFutureRev
 		}
 		if revision < m.compactRevision {
@@ -493,9 +492,9 @@ func (m *Memory) Count(ctx context.Context, prefix, startKey string, revision in
 
 func (m *Memory) Watch(ctx context.Context, prefix string, startRevision int64) server.WatchResult {
 	m.mu.RLock()
-	rev := m.currentRevision
 	compactRev := m.compactRevision
 	m.mu.RUnlock()
+	rev := m.currentRevision.Load()
 
 	events := make(chan []*server.Event, 100)
 
@@ -585,11 +584,12 @@ func (m *Memory) Compact(ctx context.Context, revision int64) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if revision > m.currentRevision {
-		return m.currentRevision, nil
+	rev := m.currentRevision.Load()
+	if revision > rev {
+		return rev, nil
 	}
 	if revision <= m.compactRevision {
-		return m.currentRevision, nil
+		return rev, nil
 	}
 
 	var toRemove []string
@@ -645,7 +645,7 @@ func (m *Memory) Compact(ctx context.Context, revision int64) (int64, error) {
 	m.log = m.log[cut:]
 
 	m.compactRevision = revision
-	return m.currentRevision, nil
+	return rev, nil
 }
 
 // seekKey returns the BTree seek target for a List/Range query and a flag
