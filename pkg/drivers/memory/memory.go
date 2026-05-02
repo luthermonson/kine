@@ -3,7 +3,6 @@ package memory
 import (
 	"context"
 	"errors"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -193,11 +192,20 @@ func (m *Memory) atRevision(key string, revision int64) *entry {
 }
 
 // logIndexAfter returns the index of the first log entry with revision > rev.
+// The log is dense and ordered, with m.log[0].revision == m.compactRevision+1,
+// so the index is just rev - m.compactRevision (clamped). For rev values at or
+// below m.compactRevision the result is 0; for rev at or above the highest
+// stored revision the result is len(m.log).
 // Caller must hold m.mu (read or write).
 func (m *Memory) logIndexAfter(rev int64) int {
-	return sort.Search(len(m.log), func(i int) bool {
-		return m.log[i].revision > rev
-	})
+	i := rev - m.compactRevision
+	if i < 0 {
+		i = 0
+	}
+	if i > int64(len(m.log)) {
+		i = int64(len(m.log))
+	}
+	return int(i)
 }
 
 // ttl runs a long-lived goroutine that watches the backend for entries with
@@ -566,12 +574,13 @@ func (m *Memory) Watch(ctx context.Context, prefix string, startRevision int64) 
 	}
 }
 
-// Compact discards history below the given revision. For each key the latest
-// entry with revision <= the compact target is preserved as the floor (so
-// reads at the compact boundary still resolve), unless that entry is a
-// tombstone — in which case the entire key history is removed. Entries with
-// revision > the compact target are always retained. The log slice is
-// rebuilt to drop any entries that are no longer referenced.
+// Compact discards events below the given revision. The log slice is trimmed
+// to entries with revision > the compact target — events at or below the
+// boundary are no longer accessible to watchers. Per-key history in m.keys is
+// trimmed to its floor (the latest entry with revision <= the target) so that
+// reads at the compact boundary still resolve to the correct value; if that
+// floor is a tombstone the entire key history is removed. Entries with
+// revision > the compact target are always retained.
 func (m *Memory) Compact(ctx context.Context, revision int64) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -583,7 +592,6 @@ func (m *Memory) Compact(ctx context.Context, revision int64) (int64, error) {
 		return m.currentRevision, nil
 	}
 
-	keep := make(map[*entry]struct{})
 	var toRemove []string
 
 	m.keys.Scan(func(key string, hist []*entry) bool {
@@ -611,14 +619,11 @@ func (m *Memory) Compact(ctx context.Context, revision int64) (int64, error) {
 
 		if len(newHist) == 0 {
 			toRemove = append(toRemove, key)
-		} else {
-			if len(newHist) != len(hist) {
-				newHist[0].prev = nil
-				m.keys.Set(key, newHist)
-			}
-			for _, e := range newHist {
-				keep[e] = struct{}{}
-			}
+		} else if len(newHist) != len(hist) {
+			// The new first entry's predecessor is being dropped; clear the
+			// pointer so the dropped entry can be garbage collected.
+			newHist[0].prev = nil
+			m.keys.Set(key, newHist)
 		}
 		return true
 	})
@@ -627,16 +632,17 @@ func (m *Memory) Compact(ctx context.Context, revision int64) (int64, error) {
 		m.keys.Delete(k)
 	}
 
-	filtered := m.log[:0]
-	for _, e := range m.log {
-		if _, ok := keep[e]; ok {
-			filtered = append(filtered, e)
-		}
+	// Trim the log. Because the log is dense and ordered by revision, the cut
+	// point is just (revision - oldCompactRevision); everything before it has
+	// revision <= the target and is no longer reachable via Watch.
+	cut := int(revision - m.compactRevision)
+	if cut > len(m.log) {
+		cut = len(m.log)
 	}
-	for i := len(filtered); i < len(m.log); i++ {
+	for i := 0; i < cut; i++ {
 		m.log[i] = nil
 	}
-	m.log = filtered
+	m.log = m.log[cut:]
 
 	m.compactRevision = revision
 	return m.currentRevision, nil
