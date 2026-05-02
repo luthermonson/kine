@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/k3s-io/kine/pkg/server"
+	"github.com/tidwall/btree"
 )
 
 func noErr(t *testing.T, err error) {
@@ -50,9 +51,12 @@ func expEqualKeys(t *testing.T, want []string, got []*server.KeyValue) {
 	}
 }
 
-func setupBackend(t *testing.T) (*Backend, context.Context) {
+func setupBackend(t *testing.T) (*Memory, context.Context) {
 	t.Helper()
-	b := NewBackend()
+	b := &Memory{
+		keys:     btree.NewMap[string, []*entry](0),
+		notifyCh: make(chan struct{}),
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	// Skip Start() to avoid the production seed entries (compact_rev_key,

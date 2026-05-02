@@ -23,7 +23,10 @@ func init() {
 
 func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, server.Backend, error) {
 	logrus.Info("using in-memory backend")
-	return false, NewBackend(), nil
+	return false, &Memory{
+		keys:     btree.NewMap[string, []*entry](0),
+		notifyCh: make(chan struct{}),
+	}, nil
 }
 
 type entry struct {
@@ -56,7 +59,7 @@ type ttlEventKV struct {
 	expiredAt   time.Time
 }
 
-type Backend struct {
+type Memory struct {
 	mu              sync.RWMutex
 	currentRevision int64
 	compactRevision int64
@@ -68,32 +71,26 @@ type Backend struct {
 	notifyCh chan struct{}
 }
 
-var _ server.Backend = (*Backend)(nil)
+// explicit interface check
+var _ server.Backend = &Memory{}
 
-func NewBackend() *Backend {
-	return &Backend{
-		keys:     btree.NewMap[string, []*entry](0),
-		notifyCh: make(chan struct{}),
-	}
-}
-
-func (b *Backend) Start(ctx context.Context) error {
+func (m *Memory) Start(ctx context.Context) error {
 	// Seed the same startup entries that SQL-backed and NATS backends do:
 	//   1. compact_rev_key — written by SQLLog.compactStart; gives the backend
 	//      a non-zero starting revision (apiserver rejects rev=0).
 	//   2. /registry/health — written by LogStructured.Start; the apiserver
 	//      uses it as a liveness probe.
-	b.mu.Lock()
-	rev := b.nextRevision()
-	b.appendEntry(&entry{
+	m.mu.Lock()
+	rev := m.nextRevision()
+	m.appendEntry(&entry{
 		revision:       rev,
 		key:            "compact_rev_key",
 		createRevision: rev,
 		version:        1,
 		created:        true,
 	})
-	rev = b.nextRevision()
-	b.appendEntry(&entry{
+	rev = m.nextRevision()
+	m.appendEntry(&entry{
 		revision:       rev,
 		key:            "/registry/health",
 		value:          []byte(`{"health":"true"}`),
@@ -101,68 +98,86 @@ func (b *Backend) Start(ctx context.Context) error {
 		version:        1,
 		created:        true,
 	})
-	b.mu.Unlock()
+	m.mu.Unlock()
 
-	go b.ttl(ctx)
+	go m.ttl(ctx)
 	return nil
 }
 
-func (b *Backend) CurrentRevision(ctx context.Context) (int64, error) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.currentRevision, nil
+func (m *Memory) CurrentRevision(ctx context.Context) (int64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.currentRevision, nil
 }
 
-func (b *Backend) DbSize(ctx context.Context) (int64, error) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
+func (m *Memory) DbSize(ctx context.Context) (int64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	var size int64
-	for _, e := range b.log {
+	for _, e := range m.log {
 		size += int64(len(e.key) + len(e.value) + 64)
 	}
 	return size, nil
 }
 
-func (b *Backend) WaitForSyncTo(revision int64) {}
+func (m *Memory) WaitForSyncTo(revision int64) {}
 
-func (b *Backend) nextRevision() int64 {
-	b.currentRevision++
-	return b.currentRevision
+// nextRevision allocates and returns the next revision.
+// Caller must hold m.mu (write).
+func (m *Memory) nextRevision() int64 {
+	m.currentRevision++
+	return m.currentRevision
 }
 
-func (b *Backend) appendEntry(e *entry) {
-	b.log = append(b.log, e)
-	hist, _ := b.keys.Get(e.key)
+// appendEntry adds e to the log and to its key's history, wiring up
+// e.prev to point at the previous entry for the same key (if any).
+// Caller must hold m.mu (write).
+func (m *Memory) appendEntry(e *entry) {
+	m.log = append(m.log, e)
+	hist, _ := m.keys.Get(e.key)
 	if len(hist) > 0 {
 		e.prev = hist[len(hist)-1]
 	}
-	b.keys.Set(e.key, append(hist, e))
+	m.keys.Set(e.key, append(hist, e))
 }
 
-func (b *Backend) broadcast() {
-	b.notifyMu.Lock()
-	close(b.notifyCh)
-	b.notifyCh = make(chan struct{})
-	b.notifyMu.Unlock()
+// broadcast wakes every goroutine currently blocked on getNotifyCh.
+// Implemented as close-and-replace rather than sync.Cond.Broadcast so that
+// waiters can select on ctx.Done() alongside the wake — sync.Cond.Wait()
+// can't be combined with context cancellation without a helper goroutine.
+func (m *Memory) broadcast() {
+	m.notifyMu.Lock()
+	close(m.notifyCh)
+	m.notifyCh = make(chan struct{})
+	m.notifyMu.Unlock()
 }
 
-func (b *Backend) getNotifyCh() <-chan struct{} {
-	b.notifyMu.Lock()
-	ch := b.notifyCh
-	b.notifyMu.Unlock()
+// getNotifyCh returns a channel that will be closed on the next broadcast.
+// Watchers should grab it BEFORE scanning the log so they don't miss a
+// broadcast that fires while they're iterating.
+func (m *Memory) getNotifyCh() <-chan struct{} {
+	m.notifyMu.Lock()
+	ch := m.notifyCh
+	m.notifyMu.Unlock()
 	return ch
 }
 
-func (b *Backend) latest(key string) *entry {
-	hist, ok := b.keys.Get(key)
+// latest returns the most recent entry for key, or nil if none exists.
+// The returned entry may be a tombstone (deleted == true).
+// Caller must hold m.mu (read or write).
+func (m *Memory) latest(key string) *entry {
+	hist, ok := m.keys.Get(key)
 	if !ok || len(hist) == 0 {
 		return nil
 	}
 	return hist[len(hist)-1]
 }
 
-func (b *Backend) atRevision(key string, revision int64) *entry {
-	hist, ok := b.keys.Get(key)
+// atRevision returns the entry for key with the highest revision <= revision,
+// or nil if no such entry exists.
+// Caller must hold m.mu (read or write).
+func (m *Memory) atRevision(key string, revision int64) *entry {
+	hist, ok := m.keys.Get(key)
 	if !ok {
 		return nil
 	}
@@ -178,10 +193,10 @@ func (b *Backend) atRevision(key string, revision int64) *entry {
 }
 
 // logIndexAfter returns the index of the first log entry with revision > rev.
-// Caller must hold at least a read lock on b.mu.
-func (b *Backend) logIndexAfter(rev int64) int {
-	return sort.Search(len(b.log), func(i int) bool {
-		return b.log[i].revision > rev
+// Caller must hold m.mu (read or write).
+func (m *Memory) logIndexAfter(rev int64) int {
+	return sort.Search(len(m.log), func(i int) bool {
+		return m.log[i].revision > rev
 	})
 }
 
@@ -191,17 +206,17 @@ func (b *Backend) logIndexAfter(rev int64) int {
 // delaying workqueue with any pre-existing leased keys, then a watch picks
 // up new ones. A handler goroutine consumes the queue and calls Delete when
 // each entry reaches its expiration time.
-func (b *Backend) ttl(ctx context.Context) {
+func (m *Memory) ttl(ctx context.Context) {
 	queue := workqueue.NewTypedDelayingQueue[string]()
 	var rwMu sync.RWMutex
 	store := make(map[string]*ttlEventKV)
 
 	go func() {
-		for b.handleTTLEvent(ctx, &rwMu, queue, store) {
+		for m.handleTTLEvent(ctx, &rwMu, queue, store) {
 		}
 	}()
 
-	rev, kvs, err := b.List(ctx, "/", "", 0, 0, false)
+	rev, kvs, err := m.List(ctx, "/", "", 0, 0, false)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) {
 			logrus.Errorf("TTL initial list failed: %v", err)
@@ -221,7 +236,7 @@ func (b *Backend) ttl(ctx context.Context) {
 	// Watch from rev+1 to avoid replaying entries we just observed via
 	// List. Anything appended after List ran has a strictly greater
 	// revision and will be picked up here.
-	wr := b.Watch(ctx, "/", rev+1)
+	wr := m.Watch(ctx, "/", rev+1)
 	if wr.CompactRevision != 0 {
 		logrus.Errorf("TTL event watch failed: %v", server.ErrCompacted)
 		queue.ShutDown()
@@ -258,7 +273,7 @@ func (b *Backend) ttl(ctx context.Context) {
 	}
 }
 
-func (b *Backend) handleTTLEvent(ctx context.Context, mu *sync.RWMutex, queue workqueue.TypedDelayingInterface[string], store map[string]*ttlEventKV) bool {
+func (m *Memory) handleTTLEvent(ctx context.Context, mu *sync.RWMutex, queue workqueue.TypedDelayingInterface[string], store map[string]*ttlEventKV) bool {
 	key, shutdown := queue.Get()
 	if shutdown {
 		logrus.Info("TTL events work queue has shut down")
@@ -279,7 +294,7 @@ func (b *Backend) handleTTLEvent(ctx context.Context, mu *sync.RWMutex, queue wo
 	}
 
 	logrus.Tracef("TTL delete key=%v, modRev=%v", kv.key, kv.modRevision)
-	if _, _, _, err := b.Delete(ctx, kv.key, kv.modRevision); err != nil && !errors.Is(err, context.Canceled) {
+	if _, _, _, err := m.Delete(ctx, kv.key, kv.modRevision); err != nil && !errors.Is(err, context.Canceled) {
 		logrus.Errorf("TTL delete trigger failed for key=%v: %v, requeuing", kv.key, err)
 		queue.AddAfter(kv.key, ttlRetryInterval)
 		return true
@@ -310,11 +325,11 @@ func storeTTLEventKV(mu *sync.RWMutex, store map[string]*ttlEventKV, kv *server.
 }
 
 // Get returns the current revision and the KeyValue for the given key.
-func (b *Backend) Get(ctx context.Context, key, rangeEnd string, limit, revision int64, keysOnly bool) (int64, *server.KeyValue, error) {
+func (m *Memory) Get(ctx context.Context, key, rangeEnd string, limit, revision int64, keysOnly bool) (int64, *server.KeyValue, error) {
 	if strings.HasSuffix(key, "/") && rangeEnd == "" {
 		key = key[:len(key)-1]
 	}
-	rev, kvs, err := b.List(ctx, key, rangeEnd, limit, revision, keysOnly)
+	rev, kvs, err := m.List(ctx, key, rangeEnd, limit, revision, keysOnly)
 	if err != nil {
 		return rev, nil, err
 	}
@@ -324,22 +339,22 @@ func (b *Backend) Get(ctx context.Context, key, rangeEnd string, limit, revision
 	return rev, kvs[0], nil
 }
 
-func (b *Backend) Create(ctx context.Context, key string, value []byte, lease int64) (int64, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+func (m *Memory) Create(ctx context.Context, key string, value []byte, lease int64) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	latest := b.latest(key)
+	latest := m.latest(key)
 	if latest != nil && !latest.deleted {
-		return b.currentRevision, server.ErrKeyExists
+		return m.currentRevision, server.ErrKeyExists
 	}
 
-	rev := b.nextRevision()
+	rev := m.nextRevision()
 	var prevRev int64
 	if latest != nil {
 		prevRev = latest.revision
 	}
 
-	b.appendEntry(&entry{
+	m.appendEntry(&entry{
 		revision:       rev,
 		key:            key,
 		value:          value,
@@ -349,23 +364,23 @@ func (b *Backend) Create(ctx context.Context, key string, value []byte, lease in
 		lease:          lease,
 		created:        true,
 	})
-	b.broadcast()
+	m.broadcast()
 	return rev, nil
 }
 
-func (b *Backend) Update(ctx context.Context, key string, value []byte, revision, lease int64) (int64, *server.KeyValue, bool, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+func (m *Memory) Update(ctx context.Context, key string, value []byte, revision, lease int64) (int64, *server.KeyValue, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	latest := b.latest(key)
+	latest := m.latest(key)
 	if latest == nil || latest.deleted {
-		return b.currentRevision, nil, false, nil
+		return m.currentRevision, nil, false, nil
 	}
 	if latest.revision != revision {
-		return b.currentRevision, latest.toKeyValue(), false, nil
+		return m.currentRevision, latest.toKeyValue(), false, nil
 	}
 
-	rev := b.nextRevision()
+	rev := m.nextRevision()
 	e := &entry{
 		revision:       rev,
 		key:            key,
@@ -375,25 +390,25 @@ func (b *Backend) Update(ctx context.Context, key string, value []byte, revision
 		prevRevision:   latest.revision,
 		lease:          lease,
 	}
-	b.appendEntry(e)
-	b.broadcast()
+	m.appendEntry(e)
+	m.broadcast()
 	return rev, e.toKeyValue(), true, nil
 }
 
-func (b *Backend) Delete(ctx context.Context, key string, revision int64) (int64, *server.KeyValue, bool, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+func (m *Memory) Delete(ctx context.Context, key string, revision int64) (int64, *server.KeyValue, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	latest := b.latest(key)
+	latest := m.latest(key)
 	if latest == nil || latest.deleted {
-		return b.currentRevision, nil, false, nil
+		return m.currentRevision, nil, false, nil
 	}
 	if revision != 0 && latest.revision != revision {
-		return b.currentRevision, latest.toKeyValue(), false, nil
+		return m.currentRevision, latest.toKeyValue(), false, nil
 	}
 
-	rev := b.nextRevision()
-	b.appendEntry(&entry{
+	rev := m.nextRevision()
+	m.appendEntry(&entry{
 		revision:       rev,
 		key:            key,
 		value:          latest.value,
@@ -403,27 +418,27 @@ func (b *Backend) Delete(ctx context.Context, key string, revision int64) (int64
 		lease:          latest.lease,
 		deleted:        true,
 	})
-	b.broadcast()
+	m.broadcast()
 	return rev, latest.toKeyValue(), true, nil
 }
 
-func (b *Backend) List(ctx context.Context, prefix, startKey string, limit, revision int64, keysOnly bool) (int64, []*server.KeyValue, error) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
+func (m *Memory) List(ctx context.Context, prefix, startKey string, limit, revision int64, keysOnly bool) (int64, []*server.KeyValue, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
-	rev := b.currentRevision
+	rev := m.currentRevision
 	if revision > 0 {
-		if revision > b.currentRevision {
+		if revision > m.currentRevision {
 			return rev, nil, server.ErrFutureRev
 		}
-		if revision < b.compactRevision {
+		if revision < m.compactRevision {
 			return rev, nil, server.ErrCompacted
 		}
 		rev = revision
 	}
 
 	seek, exact := seekKey(prefix, startKey)
-	iter := b.keys.Iter()
+	iter := m.keys.Iter()
 	if !iter.Seek(seek) {
 		return rev, nil, nil
 	}
@@ -440,9 +455,9 @@ func (b *Backend) List(ctx context.Context, prefix, startKey string, limit, revi
 
 		var e *entry
 		if revision > 0 {
-			e = b.atRevision(k, revision)
+			e = m.atRevision(k, revision)
 		} else {
-			e = b.latest(k)
+			e = m.latest(k)
 		}
 
 		if e != nil && !e.deleted {
@@ -460,19 +475,19 @@ func (b *Backend) List(ctx context.Context, prefix, startKey string, limit, revi
 	return rev, kvs, nil
 }
 
-func (b *Backend) Count(ctx context.Context, prefix, startKey string, revision int64) (int64, int64, error) {
-	rev, kvs, err := b.List(ctx, prefix, startKey, 0, revision, true)
+func (m *Memory) Count(ctx context.Context, prefix, startKey string, revision int64) (int64, int64, error) {
+	rev, kvs, err := m.List(ctx, prefix, startKey, 0, revision, true)
 	if err != nil {
 		return rev, 0, err
 	}
 	return rev, int64(len(kvs)), nil
 }
 
-func (b *Backend) Watch(ctx context.Context, prefix string, startRevision int64) server.WatchResult {
-	b.mu.RLock()
-	rev := b.currentRevision
-	compactRev := b.compactRevision
-	b.mu.RUnlock()
+func (m *Memory) Watch(ctx context.Context, prefix string, startRevision int64) server.WatchResult {
+	m.mu.RLock()
+	rev := m.currentRevision
+	compactRev := m.compactRevision
+	m.mu.RUnlock()
 
 	events := make(chan []*server.Event, 100)
 
@@ -491,19 +506,19 @@ func (b *Backend) Watch(ctx context.Context, prefix string, startRevision int64)
 		// lastSeen is the highest revision already delivered to the caller.
 		// Subsequent passes start from the first log entry whose revision is
 		// greater than lastSeen, looked up via logIndexAfter — direct array
-		// indexing by revision no longer holds once compaction trims b.log.
+		// indexing by revision no longer holds once compaction trims m.log.
 		lastSeen := startRevision - 1
 		if lastSeen < 0 {
 			lastSeen = rev
 		}
 
 		for {
-			notifyCh := b.getNotifyCh()
+			notifyCh := m.getNotifyCh()
 
-			b.mu.RLock()
+			m.mu.RLock()
 			var batch []*server.Event
-			for i := b.logIndexAfter(lastSeen); i < len(b.log); i++ {
-				e := b.log[i]
+			for i := m.logIndexAfter(lastSeen); i < len(m.log); i++ {
+				e := m.log[i]
 				if !strings.HasPrefix(e.key, prefix) {
 					lastSeen = e.revision
 					continue
@@ -522,7 +537,7 @@ func (b *Backend) Watch(ctx context.Context, prefix string, startRevision int64)
 				batch = append(batch, event)
 				lastSeen = e.revision
 			}
-			b.mu.RUnlock()
+			m.mu.RUnlock()
 
 			if len(batch) > 0 {
 				select {
@@ -557,21 +572,21 @@ func (b *Backend) Watch(ctx context.Context, prefix string, startRevision int64)
 // tombstone — in which case the entire key history is removed. Entries with
 // revision > the compact target are always retained. The log slice is
 // rebuilt to drop any entries that are no longer referenced.
-func (b *Backend) Compact(ctx context.Context, revision int64) (int64, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+func (m *Memory) Compact(ctx context.Context, revision int64) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	if revision > b.currentRevision {
-		return b.currentRevision, nil
+	if revision > m.currentRevision {
+		return m.currentRevision, nil
 	}
-	if revision <= b.compactRevision {
-		return b.currentRevision, nil
+	if revision <= m.compactRevision {
+		return m.currentRevision, nil
 	}
 
 	keep := make(map[*entry]struct{})
 	var toRemove []string
 
-	b.keys.Scan(func(key string, hist []*entry) bool {
+	m.keys.Scan(func(key string, hist []*entry) bool {
 		floorIdx := -1
 		for i, e := range hist {
 			if e.revision <= revision {
@@ -599,7 +614,7 @@ func (b *Backend) Compact(ctx context.Context, revision int64) (int64, error) {
 		} else {
 			if len(newHist) != len(hist) {
 				newHist[0].prev = nil
-				b.keys.Set(key, newHist)
+				m.keys.Set(key, newHist)
 			}
 			for _, e := range newHist {
 				keep[e] = struct{}{}
@@ -609,22 +624,22 @@ func (b *Backend) Compact(ctx context.Context, revision int64) (int64, error) {
 	})
 
 	for _, k := range toRemove {
-		b.keys.Delete(k)
+		m.keys.Delete(k)
 	}
 
-	filtered := b.log[:0]
-	for _, e := range b.log {
+	filtered := m.log[:0]
+	for _, e := range m.log {
 		if _, ok := keep[e]; ok {
 			filtered = append(filtered, e)
 		}
 	}
-	for i := len(filtered); i < len(b.log); i++ {
-		b.log[i] = nil
+	for i := len(filtered); i < len(m.log); i++ {
+		m.log[i] = nil
 	}
-	b.log = filtered
+	m.log = filtered
 
-	b.compactRevision = revision
-	return b.currentRevision, nil
+	m.compactRevision = revision
+	return m.currentRevision, nil
 }
 
 // seekKey returns the BTree seek target for a List/Range query and a flag
