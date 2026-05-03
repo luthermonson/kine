@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/k3s-io/kine/pkg/server"
+	"github.com/k3s-io/kine/pkg/ttl"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/sirupsen/logrus"
@@ -101,7 +102,6 @@ func (b *Backend) Start(ctx context.Context) error {
 	b.ctx = ctx
 
 	b.kv.Start(b.ctx)
-	b.kv.ew.Start(b.ctx)
 
 	// Wait for btree watcher to finish initial replay before accepting operations
 	// This prevents reads from seeing inconsistent state during startup
@@ -131,6 +131,7 @@ func (b *Backend) Start(ctx context.Context) error {
 	}
 
 	go b.compactWatcher()
+	go ttl.Run(ctx, b)
 
 	return nil
 }
@@ -236,10 +237,6 @@ func (b *Backend) Create(ctx context.Context, key string, value []byte, lease in
 			}
 			return b.kv.BucketRevision(), err
 		}
-	}
-
-	if lease > 0 {
-		b.kv.ew.Add(key, int64(seq), time.Now().Add(time.Second*time.Duration(lease)))
 	}
 
 	return int64(seq), nil
@@ -379,10 +376,6 @@ func (b *Backend) Update(ctx context.Context, key string, value []byte, revision
 	}
 
 	nv.KV.ModRevision = int64(seq)
-
-	if lease > 0 {
-		b.kv.ew.Add(key, int64(seq), time.Now().Add(time.Second*time.Duration(lease)))
-	}
 
 	return int64(seq), nv.KV, true, nil
 }

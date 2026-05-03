@@ -125,7 +125,6 @@ type KeyValue struct {
 	kc         *keyCodec
 	vc         *valueCodec
 	bt         *btree.Map[string, []*seqOp]
-	ew         *ExpireWatcher
 	btm        sync.RWMutex
 	lastSeq    atomic.Uint64
 	compactRev atomic.Int64
@@ -137,7 +136,7 @@ type KeyValue struct {
 	wg         *sync.WaitGroup
 }
 
-func NewKeyValue(name string, wg *sync.WaitGroup, bucket jetstream.KeyValue, js jetstream.JetStream, revHistory int, deleteFn DeleteFn) *KeyValue {
+func NewKeyValue(name string, wg *sync.WaitGroup, bucket jetstream.KeyValue, js jetstream.JetStream, revHistory int) *KeyValue {
 	kv := &KeyValue{
 		name:       name,
 		revHistory: revHistory,
@@ -146,7 +145,6 @@ func NewKeyValue(name string, wg *sync.WaitGroup, bucket jetstream.KeyValue, js 
 		kc:         &keyCodec{},
 		vc:         &valueCodec{},
 		bt:         btree.NewMap[string, []*seqOp](0),
-		ew:         NewExpireWatcher(deleteFn),
 		seqCond:    sync.NewCond(&sync.Mutex{}),
 		readyCh:    make(chan struct{}),
 		wg:         wg,

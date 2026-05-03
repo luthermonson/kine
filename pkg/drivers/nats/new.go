@@ -215,7 +215,7 @@ func newBackend(ctx context.Context, wg *sync.WaitGroup, connection string, tlsI
 		compactMinRetain: compactMinRetain,
 	}
 
-	kv := NewKeyValue(name, wg, bucket, js, int(config.revHistory), b.Delete)
+	kv := NewKeyValue(name, wg, bucket, js, int(config.revHistory))
 
 	b.kv = kv
 

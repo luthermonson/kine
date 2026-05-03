@@ -42,7 +42,7 @@ func setupBackend(ctx context.Context, wg *sync.WaitGroup, t *testing.T) (*serve
 		l: l,
 	}
 
-	ekv := NewKeyValue("local", wg, bkt, js, 10, b.Delete)
+	ekv := NewKeyValue("local", wg, bkt, js, 10)
 
 	b.kv = ekv
 
