@@ -2,20 +2,16 @@ package memory
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/k3s-io/kine/pkg/drivers"
 	"github.com/k3s-io/kine/pkg/server"
+	"github.com/k3s-io/kine/pkg/ttl"
 	"github.com/sirupsen/logrus"
 	"github.com/tidwall/btree"
-	"k8s.io/client-go/util/workqueue"
 )
-
-const ttlRetryInterval = 250 * time.Millisecond
 
 func init() {
 	drivers.Register("memory", New)
@@ -51,12 +47,6 @@ func (e *entry) toKeyValue() *server.KeyValue {
 		Version:        e.version,
 		Lease:          e.lease,
 	}
-}
-
-type ttlEventKV struct {
-	key         string
-	modRevision int64
-	expiredAt   time.Time
 }
 
 type Memory struct {
@@ -100,7 +90,7 @@ func (m *Memory) Start(ctx context.Context) error {
 	})
 	m.mu.Unlock()
 
-	go m.ttl(ctx)
+	go ttl.Run(ctx, m)
 	return nil
 }
 
@@ -205,130 +195,6 @@ func (m *Memory) logIndexAfter(rev int64) int {
 		i = int64(len(m.log))
 	}
 	return int(i)
-}
-
-// ttl runs a long-lived goroutine that watches the backend for entries with
-// a non-zero Lease and schedules them for deletion once their TTL expires.
-// It mirrors logstructured.LogStructured.ttl: an initial list seeds the
-// delaying workqueue with any pre-existing leased keys, then a watch picks
-// up new ones. A handler goroutine consumes the queue and calls Delete when
-// each entry reaches its expiration time.
-func (m *Memory) ttl(ctx context.Context) {
-	queue := workqueue.NewTypedDelayingQueue[string]()
-	var rwMu sync.RWMutex
-	store := make(map[string]*ttlEventKV)
-
-	go func() {
-		for m.handleTTLEvent(ctx, &rwMu, queue, store) {
-		}
-	}()
-
-	rev, kvs, err := m.List(ctx, "/", "", 0, 0, false)
-	if err != nil {
-		if !errors.Is(err, context.Canceled) {
-			logrus.Errorf("TTL initial list failed: %v", err)
-		}
-		queue.ShutDown()
-		return
-	}
-	for _, kv := range kvs {
-		if kv.Lease <= 0 {
-			continue
-		}
-		expires := storeTTLEventKV(&rwMu, store, kv)
-		logrus.Tracef("TTL add event key=%v, modRev=%v, ttl=%v", kv.Key, kv.ModRevision, expires)
-		queue.AddAfter(kv.Key, expires)
-	}
-
-	// Watch from rev+1 to avoid replaying entries we just observed via
-	// List. Anything appended after List ran has a strictly greater
-	// revision and will be picked up here.
-	wr := m.Watch(ctx, "/", rev+1)
-	if wr.CompactRevision != 0 {
-		logrus.Errorf("TTL event watch failed: %v", server.ErrCompacted)
-		queue.ShutDown()
-		return
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			queue.ShutDown()
-			return
-		case events, ok := <-wr.Events:
-			if !ok {
-				queue.ShutDown()
-				return
-			}
-			for _, event := range events {
-				if event.Delete || event.KV.Lease <= 0 {
-					continue
-				}
-				kv := event.KV
-				stored := loadTTLEventKV(&rwMu, store, kv.Key)
-				if stored == nil {
-					expires := storeTTLEventKV(&rwMu, store, kv)
-					logrus.Tracef("TTL add event key=%v, modRev=%v, ttl=%v", kv.Key, kv.ModRevision, expires)
-					queue.AddAfter(kv.Key, expires)
-				} else if kv.ModRevision > stored.modRevision {
-					expires := storeTTLEventKV(&rwMu, store, kv)
-					logrus.Tracef("TTL update event key=%v, modRev=%v, ttl=%v", kv.Key, kv.ModRevision, expires)
-					queue.AddAfter(kv.Key, expires)
-				}
-			}
-		}
-	}
-}
-
-func (m *Memory) handleTTLEvent(ctx context.Context, mu *sync.RWMutex, queue workqueue.TypedDelayingInterface[string], store map[string]*ttlEventKV) bool {
-	key, shutdown := queue.Get()
-	if shutdown {
-		logrus.Info("TTL events work queue has shut down")
-		return false
-	}
-	defer queue.Done(key)
-
-	kv := loadTTLEventKV(mu, store, key)
-	if kv == nil {
-		logrus.Errorf("TTL event not found for key=%v", key)
-		return true
-	}
-
-	if expires := time.Until(kv.expiredAt); expires > 0 {
-		logrus.Tracef("TTL has not expired for key=%v, ttl=%v, requeuing", key, expires)
-		queue.AddAfter(key, expires)
-		return true
-	}
-
-	logrus.Tracef("TTL delete key=%v, modRev=%v", kv.key, kv.modRevision)
-	if _, _, _, err := m.Delete(ctx, kv.key, kv.modRevision); err != nil && !errors.Is(err, context.Canceled) {
-		logrus.Errorf("TTL delete trigger failed for key=%v: %v, requeuing", kv.key, err)
-		queue.AddAfter(kv.key, ttlRetryInterval)
-		return true
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	delete(store, kv.key)
-	return true
-}
-
-func loadTTLEventKV(mu *sync.RWMutex, store map[string]*ttlEventKV, key string) *ttlEventKV {
-	mu.RLock()
-	defer mu.RUnlock()
-	return store[key]
-}
-
-func storeTTLEventKV(mu *sync.RWMutex, store map[string]*ttlEventKV, kv *server.KeyValue) time.Duration {
-	mu.Lock()
-	defer mu.Unlock()
-	expires := time.Duration(kv.Lease) * time.Second
-	store[kv.Key] = &ttlEventKV{
-		key:         kv.Key,
-		modRevision: kv.ModRevision,
-		expiredAt:   time.Now().Add(expires),
-	}
-	return expires
 }
 
 // Get returns the current revision and the KeyValue for the given key.

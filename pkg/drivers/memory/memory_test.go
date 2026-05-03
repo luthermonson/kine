@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/k3s-io/kine/pkg/server"
+	"github.com/k3s-io/kine/pkg/ttl"
 	"github.com/tidwall/btree"
 )
 
@@ -61,7 +62,7 @@ func setupBackend(t *testing.T) (*Memory, context.Context) {
 	t.Cleanup(cancel)
 	// Skip Start() to avoid the production seed entries (compact_rev_key,
 	// /registry/health) so tests can assert exact revision values.
-	go b.ttl(ctx)
+	go ttl.Run(ctx, b)
 	return b, ctx
 }
 
