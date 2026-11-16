@@ -1,134 +1,86 @@
-name: Release
+name: release
+
+# Build the kine binary with the Dolt-backed beads driver natively on each
+# target arch (no emulation — a big CGO/Dolt build segfaults under qemu) and
+# publish a GitHub release. kine builds against upstream beads via a go.mod
+# replace (../beads), so each job checks beads out as a sibling of kine.
+#
+# Cut a release:  git tag beads-v0.1.0 && git push origin beads-v0.1.0
+
 on:
-  release:
-    types:
-      - created
+  push:
+    tags:
+      - 'beads-v*'
+
+permissions:
+  contents: write
+
+env:
+  # The github.com/steveyegge/beads commit go.mod's `replace` expects.
+  BEADS_REF: 125c62063406d064d8392f3245920b47e9c81f85
 
 jobs:
-  release:
-    name: Release
-    runs-on: ubuntu-latest
-    env:
-      ARCH: amd64
-      TAG: ${{ github.ref_name }}
-    permissions:
-      contents: write # Needed to update release with binary assets
-      packages: write # Needed for GHCR image push
-      id-token: write # needed for the Vault authentication
-      attestations: write # needed for attest action
-      artifact-metadata: write # needed for attestation upload to GHCR
+  build:
+    name: build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            asset: kine-beads-linux-amd64
+          - runner: ubuntu-24.04-arm
+            asset: kine-beads-linux-arm64
+          - runner: macos-latest
+            asset: kine-beads-darwin-arm64
     steps:
-      - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
-
-      - name: Build binaries
-        run: make multi-arch-build
-
-      - name: Build binaries (nocgo)
-        run: make multi-arch-build CGO_ENABLED=0
-
-      - name: Compute checksum for each binary
+      - uses: actions/checkout@v4
+        with:
+          path: kine
+      - uses: actions/checkout@v4
+        with:
+          repository: gastownhall/beads
+          ref: ${{ env.BEADS_REF }}
+          path: beads          # sibling of kine/ → satisfies go.mod `replace => ../beads`
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: kine/go.mod
+      - name: build
+        working-directory: kine
         run: |
-          arch=("amd64" "arm64" "arm" "riscv64")
-          cd dist/artifacts
-          for a in "${arch[@]}"; do
-            sha256sum kine-"${a}" > sha256sum-"${a}".txt
-            sha256sum kine-"${a}-nocgo" > sha256sum-"${a}-nocgo".txt
-          done
-          
-      - name: Attest binaries
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+          CGO_ENABLED=1 go build -tags gms_pure_go -o "${{ matrix.asset }}" .
+          ls -la "${{ matrix.asset }}"
+          file "${{ matrix.asset }}" || true
+      - uses: actions/upload-artifact@v4
         with:
-          subject-path: dist/artifacts/kine-*
+          name: ${{ matrix.asset }}
+          path: kine/${{ matrix.asset }}
+          if-no-files-found: error
 
-      - name: Upload binaries to release
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
         with:
-          files: |
-            dist/artifacts/kine-*
-            dist/artifacts/*.txt
-
-      - name: "Read Vault secrets"
-        if: github.repository_owner == 'k3s-io'
-        uses: rancher-eio/read-vault-secrets@0da85151ad1f19ed7986c41587e45aac1ace74b6 # v3
-        with:
-          secrets: |
-            secret/data/github/repo/${{ github.repository }}/dockerhub/rancher/credentials username | DOCKER_USERNAME ;
-            secret/data/github/repo/${{ github.repository }}/dockerhub/rancher/credentials password | DOCKER_TOKEN ;
-    
-      - name: Set DockerHub repo
-        if: github.repository_owner != 'k3s-io'
+          path: dist
+          merge-multiple: true
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          echo "DOCKER_USERNAME=${{ secrets.DOCKER_USERNAME }}" >> "$GITHUB_ENV"
+          ls -la dist
+          gh release create "${{ github.ref_name }}" dist/* \
+            --title "kine-beads ${{ github.ref_name }}" \
+            --notes "kine with the Dolt-backed beads driver (k3s-on-beads).
 
-      - name: Login to DockerHub with Rancher Secrets
-        if: github.repository_owner == 'k3s-io'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
-        with:
-          username: ${{ env.DOCKER_USERNAME }}
-          password: ${{ env.DOCKER_TOKEN }}
+          Binaries: linux/amd64, linux/arm64, darwin/arm64.
+          Built \`CGO_ENABLED=1 go build -tags gms_pure_go\` against beads @ \`${{ env.BEADS_REF }}\`.
 
-      # For forks, setup DockerHub login with GHA secrets
-      - name: Login to DockerHub with GHA Secrets
-        if: github.repository_owner != 'k3s-io'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_TOKEN }}
-      
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
-        id: build
-        with:
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
-          context: .
-          target: multi-arch-package
-          push: true
-          tags: |
-            ${{ env.DOCKER_USERNAME }}/kine:latest
-            ${{ env.DOCKER_USERNAME }}/kine:${{ github.ref_name }}
-            ghcr.io/${{ github.repository_owner }}/kine:latest
-            ghcr.io/${{ github.repository_owner }}/kine:${{ github.ref_name }}
-
-      - name: Attest images
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
-        id: attest
-        with:
-          subject-name: ghcr.io/${{ github.repository_owner }}/kine
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
-
-      - name: Build and push (nocgo)
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
-        id: build-nocgo
-        with:
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
-          context: .
-          target: multi-arch-package
-          push: true
-          build-args: |
-            CGO_ENABLED=0
-            NOCGO=-nocgo
-          tags: |
-            ${{ env.DOCKER_USERNAME }}/kine:latest-nocgo
-            ${{ env.DOCKER_USERNAME }}/kine:${{ github.ref_name }}-nocgo
-            ghcr.io/${{ github.repository_owner }}/kine:latest-nocgo
-            ghcr.io/${{ github.repository_owner }}/kine:${{ github.ref_name }}-nocgo
-
-      - name: Attest images (nocgo)
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
-        id: attest-nocgo
-        with:
-          subject-name: ghcr.io/${{ github.repository_owner }}/kine
-          subject-digest: ${{ steps.build-nocgo.outputs.digest }}
-          push-to-registry: true
+          Run as the k3s datastore:
+          \`\`\`
+          kine-beads --endpoint 'beads:///path/to/data?server=127.0.0.1:3307' --listen-address tcp://0.0.0.0:2379
+          k3s server --datastore-endpoint=http://127.0.0.1:2379
+          \`\`\`"
