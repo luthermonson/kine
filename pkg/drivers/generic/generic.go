@@ -78,6 +78,13 @@ type Generic struct {
 
 	LockWrites              bool
 	LastInsertID            bool
+	// ForceDefaultIsolation makes BeginTx ignore the caller's requested SQL
+	// isolation level and use the driver default instead. Set by backends
+	// whose driver rejects explicit levels — notably embedded Dolt
+	// (dolthub/driver/v2), which errors "isolation level not supported" for
+	// anything but the default and provides its own MVCC snapshot per
+	// transaction regardless. See pkg/drivers/beads.
+	ForceDefaultIsolation   bool
 	DB                      *sql.DB
 	GetSingleSQL            *query.Named
 	GetSingleValSQL         *query.Named

@@ -25,6 +25,11 @@ func (d *Generic) BeginTx(ctx context.Context, opts *sql.TxOptions) (server.Tran
 	if opts == nil {
 		opts = &sql.TxOptions{Isolation: sql.LevelRepeatableRead}
 	}
+	if d.ForceDefaultIsolation && opts.Isolation != sql.LevelDefault {
+		// Drivers like embedded Dolt reject explicit isolation levels; fall
+		// back to the default, preserving only the read-only hint.
+		opts = &sql.TxOptions{Isolation: sql.LevelDefault, ReadOnly: opts.ReadOnly}
+	}
 	id := uuid.New()
 	logrus.Tracef("TX BEGIN id=%s, isolation='%s'", id, opts.Isolation)
 	x, err := d.DB.BeginTx(ctx, opts)
